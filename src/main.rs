@@ -3247,6 +3247,9 @@ async fn initialize_agents(
                     tracing::error!(%error, adapter = %instance.name, "failed to create named mattermost adapter");
                 }
             }
+        }
+    }
+
     // Shared Signal permissions (hot-reloadable via file watcher)
     *signal_permissions = config.messaging.signal.as_ref().map(|signal_config| {
         let perms = spacebot::config::SignalPermissions::from_config(signal_config);
