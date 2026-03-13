@@ -37,6 +37,8 @@ pub struct MattermostAdapter {
     permissions: Arc<ArcSwap<MattermostPermissions>>,
     bot_user_id: OnceCell<Arc<str>>,
     bot_username: OnceCell<Arc<str>>,
+    user_identity_cache: Arc<RwLock<HashMap<String, String>>>,
+    channel_name_cache: Arc<RwLock<HashMap<String, String>>>,
     active_messages: Arc<RwLock<HashMap<String, ActiveStream>>>,
     typing_tasks: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
@@ -91,6 +93,8 @@ impl MattermostAdapter {
             permissions,
             bot_user_id: OnceCell::new(),
             bot_username: OnceCell::new(),
+            user_identity_cache: Arc::new(RwLock::new(HashMap::new())),
+            channel_name_cache: Arc::new(RwLock::new(HashMap::new())),
             active_messages: Arc::new(RwLock::new(HashMap::new())),
             typing_tasks: Arc::new(RwLock::new(HashMap::new())),
             shutdown_tx: Arc::new(RwLock::new(None)),
@@ -330,6 +334,11 @@ impl Messaging for MattermostAdapter {
         let token = self.token.clone();
         let permissions = self.permissions.clone();
         let bot_user_id = user_id;
+        let bot_username_ws = username;
+        let user_identity_cache = self.user_identity_cache.clone();
+        let channel_name_cache = self.channel_name_cache.clone();
+        let ws_client = self.client.clone();
+        let ws_base_url = self.base_url.clone();
         let inbound_tx_clone = inbound_tx.clone();
 
         let handle = tokio::spawn(async move {
@@ -389,12 +398,31 @@ impl Messaging for MattermostAdapter {
 
                                                             let team_id = event.broadcast.team_id.clone();
                                                             let perms = permissions.load();
+
+                                                            let display_name = resolve_user_display_name(
+                                                                &user_identity_cache,
+                                                                &ws_client,
+                                                                token.as_ref(),
+                                                                &ws_base_url,
+                                                                &post.user_id,
+                                                            ).await;
+                                                            let channel_name = resolve_channel_name(
+                                                                &channel_name_cache,
+                                                                &ws_client,
+                                                                token.as_ref(),
+                                                                &ws_base_url,
+                                                                &post.channel_id,
+                                                            ).await;
+
                                                             if let Some(msg) = build_message_from_post(
                                                                 &post,
                                                                 &runtime_key,
                                                                 &bot_user_id,
+                                                                &bot_username_ws,
                                                                 &team_id,
                                                                 &perms,
+                                                                display_name.as_deref(),
+                                                                channel_name.as_deref(),
                                                             ) {
                                                                 if inbound_tx_clone.send(msg).await.is_err() {
                                                                     tracing::debug!("inbound channel closed");
@@ -550,7 +578,7 @@ impl Messaging for MattermostAdapter {
                     .ok_or_else(|| {
                         anyhow::anyhow!("missing mattermost_post_id metadata")
                     })?;
-                let emoji_name = emoji.trim_matches(':');
+                let emoji_name = sanitize_reaction_name(&emoji);
 
                 let bot_user_id = self
                     .bot_user_id
@@ -703,7 +731,7 @@ impl Messaging for MattermostAdapter {
                 author: p.user_id,
                 content: p.message,
                 is_bot: false,
-                timestamp: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(p.create_at),
             })
             .collect();
 
@@ -811,8 +839,11 @@ fn build_message_from_post(
     post: &MattermostPost,
     runtime_key: &str,
     bot_user_id: &str,
+    bot_username: &str,
     team_id: &Option<String>,
     permissions: &MattermostPermissions,
+    display_name: Option<&str>,
+    channel_name: Option<&str>,
 ) -> Option<InboundMessage> {
     if post.user_id == bot_user_id {
         return None;
@@ -889,6 +920,31 @@ fn build_message_from_post(
         );
     }
 
+    // FN1: sender display name
+    if let Some(dn) = display_name {
+        metadata.insert("sender_display_name".into(), serde_json::json!(dn));
+    }
+
+    // FN2: channel name
+    if let Some(cn) = channel_name {
+        metadata.insert("mattermost_channel_name".into(), serde_json::json!(cn));
+        metadata.insert(
+            crate::metadata_keys::CHANNEL_NAME.into(),
+            serde_json::json!(cn),
+        );
+    }
+
+    // FN4: bot mention detection — check for @bot_username in message text
+    let mentions_bot = !bot_username.is_empty()
+        && post.message.contains(&format!("@{bot_username}"));
+    metadata.insert(
+        "mattermost_mentions_or_replies_to_bot".into(),
+        serde_json::json!(mentions_bot),
+    );
+
+    // FN1: formatted_author — "Display Name" when display name is available
+    let formatted_author = display_name.map(|dn| dn.to_string());
+
     Some(InboundMessage {
         id: post.id.clone(),
         source: "mattermost".into(),
@@ -900,7 +956,7 @@ fn build_message_from_post(
         timestamp: chrono::DateTime::from_timestamp_millis(post.create_at)
             .unwrap_or_else(chrono::Utc::now),
         metadata,
-        formatted_author: None,
+        formatted_author,
     })
 }
 
@@ -910,6 +966,33 @@ fn build_message_from_post(
 struct MattermostUser {
     id: String,
     username: String,
+    #[serde(default)]
+    first_name: String,
+    #[serde(default)]
+    last_name: String,
+    #[serde(default)]
+    nickname: String,
+}
+
+impl MattermostUser {
+    fn display_name(&self) -> String {
+        if !self.nickname.is_empty() {
+            return self.nickname.clone();
+        }
+        let full = format!("{} {}", self.first_name, self.last_name);
+        let full = full.trim();
+        if !full.is_empty() {
+            return full.to_string();
+        }
+        self.username.clone()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MattermostChannel {
+    #[allow(dead_code)]
+    id: String,
+    display_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -974,6 +1057,74 @@ struct MattermostWsBroadcast {
     user_id: Option<String>,
 }
 
+async fn resolve_user_display_name(
+    cache: &RwLock<HashMap<String, String>>,
+    client: &Client,
+    token: &str,
+    base_url: &Url,
+    user_id: &str,
+) -> Option<String> {
+    if let Some(name) = cache.read().await.get(user_id).cloned() {
+        return Some(name);
+    }
+    let mut url = base_url.clone();
+    url.path_segments_mut()
+        .ok()?
+        .extend(["api", "v4", "users", user_id]);
+    let resp = client.get(url).bearer_auth(token).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let user: MattermostUser = resp.json().await.ok()?;
+    let name = user.display_name();
+    cache.write().await.insert(user_id.to_string(), name.clone());
+    Some(name)
+}
+
+async fn resolve_channel_name(
+    cache: &RwLock<HashMap<String, String>>,
+    client: &Client,
+    token: &str,
+    base_url: &Url,
+    channel_id: &str,
+) -> Option<String> {
+    if let Some(name) = cache.read().await.get(channel_id).cloned() {
+        return Some(name);
+    }
+    let mut url = base_url.clone();
+    url.path_segments_mut()
+        .ok()?
+        .extend(["api", "v4", "channels", channel_id]);
+    let resp = client.get(url).bearer_auth(token).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let channel: MattermostChannel = resp.json().await.ok()?;
+    let name = channel.display_name;
+    cache.write().await.insert(channel_id.to_string(), name.clone());
+    Some(name)
+}
+
+/// Convert an emoji input to a Mattermost reaction short-code name.
+///
+/// Handles three input forms:
+/// 1. Unicode emoji (e.g. "👍") → looked up via the `emojis` crate → "thumbsup"
+/// 2. Colon-wrapped short-code (e.g. ":thumbsup:") → stripped to "thumbsup"
+/// 3. Plain short-code (e.g. "thumbsup") → lowercased and passed through
+fn sanitize_reaction_name(emoji: &str) -> String {
+    let trimmed = emoji.trim();
+    if let Some(e) = emojis::get(trimmed) {
+        if let Some(shortcode) = e.shortcode() {
+            return shortcode.to_string();
+        }
+        return e.name().replace(' ', "_").to_lowercase();
+    }
+    trimmed
+        .trim_start_matches(':')
+        .trim_end_matches(':')
+        .to_lowercase()
+}
+
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
         return vec![text.to_string()];
@@ -1030,18 +1181,26 @@ mod tests {
         }
     }
 
+    fn bmfp(p: &MattermostPost, bot_id: &str, team_id: Option<&str>, perms: &MattermostPermissions) -> Option<InboundMessage> {
+        build_message_from_post(p, "mattermost", bot_id, "botuser", &team_id.map(String::from), perms, None, None)
+    }
+
+    fn bmfp_named(p: &MattermostPost, bot_id: &str, bot_username: &str, team_id: Option<&str>, perms: &MattermostPermissions, display_name: Option<&str>, channel_name: Option<&str>) -> Option<InboundMessage> {
+        build_message_from_post(p, "mattermost", bot_id, bot_username, &team_id.map(String::from), perms, display_name, channel_name)
+    }
+
     // --- build_message_from_post ---
 
     #[test]
     fn bot_messages_are_filtered() {
         let p = post("bot123", "chan1", None);
-        assert!(build_message_from_post(&p, "mattermost", "bot123", &None, &no_filters()).is_none());
+        assert!(bmfp(&p, "bot123", None, &no_filters()).is_none());
     }
 
     #[test]
     fn non_bot_message_passes_without_filters() {
         let p = post("user1", "chan1", None);
-        assert!(build_message_from_post(&p, "mattermost", "bot123", &Some("team1".into()), &no_filters()).is_some());
+        assert!(bmfp(&p, "bot123", Some("team1"), &no_filters()).is_some());
     }
 
     #[test]
@@ -1052,7 +1211,7 @@ mod tests {
             channel_filter: HashMap::new(),
             dm_allowed_users: vec![],
         };
-        assert!(build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &perms).is_some());
+        assert!(bmfp(&p, "bot", Some("team1"), &perms).is_some());
     }
 
     #[test]
@@ -1063,7 +1222,7 @@ mod tests {
             channel_filter: HashMap::new(),
             dm_allowed_users: vec![],
         };
-        assert!(build_message_from_post(&p, "mattermost", "bot", &Some("team2".into()), &perms).is_none());
+        assert!(bmfp(&p, "bot", Some("team2"), &perms).is_none());
     }
 
     #[test]
@@ -1075,7 +1234,7 @@ mod tests {
             dm_allowed_users: vec![],
         };
         // No team_id in the event — must reject (fail-closed)
-        assert!(build_message_from_post(&p, "mattermost", "bot", &None, &perms).is_none());
+        assert!(bmfp(&p, "bot", None, &perms).is_none());
     }
 
     #[test]
@@ -1084,7 +1243,7 @@ mod tests {
         let mut cf = HashMap::new();
         cf.insert("team1".into(), vec!["chan1".into()]);
         let perms = MattermostPermissions { team_filter: None, channel_filter: cf, dm_allowed_users: vec![] };
-        assert!(build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &perms).is_some());
+        assert!(bmfp(&p, "bot", Some("team1"), &perms).is_some());
     }
 
     #[test]
@@ -1093,7 +1252,7 @@ mod tests {
         let mut cf = HashMap::new();
         cf.insert("team1".into(), vec!["chan1".into()]);
         let perms = MattermostPermissions { team_filter: None, channel_filter: cf, dm_allowed_users: vec![] };
-        assert!(build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &perms).is_none());
+        assert!(bmfp(&p, "bot", Some("team1"), &perms).is_none());
     }
 
     #[test]
@@ -1103,7 +1262,7 @@ mod tests {
         cf.insert("team1".into(), vec!["chan1".into()]);
         let perms = MattermostPermissions { team_filter: None, channel_filter: cf, dm_allowed_users: vec![] };
         // No team_id → can't look up allowed channels → reject
-        assert!(build_message_from_post(&p, "mattermost", "bot", &None, &perms).is_none());
+        assert!(bmfp(&p, "bot", None, &perms).is_none());
     }
 
     fn dm_perms(allowed: &[&str]) -> MattermostPermissions {
@@ -1117,39 +1276,39 @@ mod tests {
     #[test]
     fn dm_blocked_when_dm_allowed_users_empty() {
         let p = post("user1", "chan1", Some("D"));
-        assert!(build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &no_filters()).is_none());
+        assert!(bmfp(&p, "bot", Some("team1"), &no_filters()).is_none());
     }
 
     #[test]
     fn dm_allowed_for_listed_user() {
         let p = post("user1", "chan1", Some("D"));
-        assert!(build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &dm_perms(&["user1"])).is_some());
+        assert!(bmfp(&p, "bot", Some("team1"), &dm_perms(&["user1"])).is_some());
     }
 
     #[test]
     fn dm_blocked_for_unlisted_user() {
         let p = post("user2", "chan1", Some("D"));
-        assert!(build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &dm_perms(&["user1"])).is_none());
+        assert!(bmfp(&p, "bot", Some("team1"), &dm_perms(&["user1"])).is_none());
     }
 
     #[test]
     fn dm_filter_does_not_affect_channel_messages() {
         // channel messages (type "O") pass even with empty dm_allowed_users
         let p = post("user1", "chan1", Some("O"));
-        assert!(build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &no_filters()).is_some());
+        assert!(bmfp(&p, "bot", Some("team1"), &no_filters()).is_some());
     }
 
     #[test]
     fn dm_conversation_id_uses_user_id() {
         let p = post("user1", "chan1", Some("D"));
-        let msg = build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &dm_perms(&["user1"])).unwrap();
+        let msg = bmfp(&p, "bot", Some("team1"), &dm_perms(&["user1"])).unwrap();
         assert!(msg.conversation_id.contains(":dm:user1"), "expected DM conversation_id, got {}", msg.conversation_id);
     }
 
     #[test]
     fn channel_conversation_id_uses_channel_id() {
         let p = post("user1", "chan1", Some("O"));
-        let msg = build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &no_filters()).unwrap();
+        let msg = bmfp(&p, "bot", Some("team1"), &no_filters()).unwrap();
         assert!(msg.conversation_id.contains(":chan1"), "expected channel conversation_id, got {}", msg.conversation_id);
         assert!(!msg.conversation_id.contains(":dm:"), "should not be DM, got {}", msg.conversation_id);
     }
@@ -1157,8 +1316,85 @@ mod tests {
     #[test]
     fn message_id_metadata_is_set() {
         let p = post("user1", "chan1", None);
-        let msg = build_message_from_post(&p, "mattermost", "bot", &Some("team1".into()), &no_filters()).unwrap();
+        let msg = bmfp(&p, "bot", Some("team1"), &no_filters()).unwrap();
         assert!(msg.metadata.contains_key(crate::metadata_keys::MESSAGE_ID));
+    }
+
+    // --- FN4: bot mention detection ---
+
+    #[test]
+    fn mention_sets_flag_when_at_bot_username_in_message() {
+        let mut p = post("user1", "chan1", Some("O"));
+        p.message = "hey @botuser can you help?".into();
+        let msg = bmfp(&p, "bot", Some("team1"), &no_filters()).unwrap();
+        assert_eq!(
+            msg.metadata.get("mattermost_mentions_or_replies_to_bot").and_then(|v| v.as_bool()),
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn no_mention_flag_when_bot_not_mentioned() {
+        let p = post("user1", "chan1", Some("O"));
+        let msg = bmfp(&p, "bot", Some("team1"), &no_filters()).unwrap();
+        assert_eq!(
+            msg.metadata.get("mattermost_mentions_or_replies_to_bot").and_then(|v| v.as_bool()),
+            Some(false),
+        );
+    }
+
+    // --- FN1: display name / sender_display_name ---
+
+    #[test]
+    fn sender_display_name_set_when_provided() {
+        let p = post("user1", "chan1", Some("O"));
+        let msg = bmfp_named(&p, "bot", "botuser", Some("team1"), &no_filters(), Some("Alice"), None).unwrap();
+        assert_eq!(
+            msg.metadata.get("sender_display_name").and_then(|v| v.as_str()),
+            Some("Alice"),
+        );
+        assert_eq!(msg.formatted_author.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn sender_display_name_absent_when_not_provided() {
+        let p = post("user1", "chan1", Some("O"));
+        let msg = bmfp(&p, "bot", Some("team1"), &no_filters()).unwrap();
+        assert!(msg.metadata.get("sender_display_name").is_none());
+        assert!(msg.formatted_author.is_none());
+    }
+
+    // --- FN2: channel name ---
+
+    #[test]
+    fn channel_name_metadata_set_when_provided() {
+        let p = post("user1", "chan1", Some("O"));
+        let msg = bmfp_named(&p, "bot", "botuser", Some("team1"), &no_filters(), None, Some("general")).unwrap();
+        assert_eq!(
+            msg.metadata.get("mattermost_channel_name").and_then(|v| v.as_str()),
+            Some("general"),
+        );
+        assert_eq!(
+            msg.metadata.get(crate::metadata_keys::CHANNEL_NAME).and_then(|v| v.as_str()),
+            Some("general"),
+        );
+    }
+
+    // --- SEC2: sanitize_reaction_name ---
+
+    #[test]
+    fn sanitize_reaction_unicode_to_shortcode() {
+        assert_eq!(sanitize_reaction_name("\u{1F44D}"), "+1");
+    }
+
+    #[test]
+    fn sanitize_reaction_colon_wrapped() {
+        assert_eq!(sanitize_reaction_name(":thumbsup:"), "thumbsup");
+    }
+
+    #[test]
+    fn sanitize_reaction_plain_lowercased() {
+        assert_eq!(sanitize_reaction_name("ThumbsUp"), "thumbsup");
     }
 
     // --- split_message ---
