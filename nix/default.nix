@@ -181,8 +181,8 @@
 
   # Post-patch hook that replaces the vendored imap-proto with our patched version
   postPatchImapProto = ''
-    # Find and replace imap-proto in cargo vendor directories
-    find /build -type d -name "imap-proto-*" 2>/dev/null | while read dir; do
+    replace_imap_proto() {
+      local dir="$1"
       echo "Found imap-proto at: $dir"
       if [ -f "$dir/Cargo.toml" ]; then
         echo "Replacing with patched version"
@@ -190,26 +190,20 @@
         cp -r ${cargoSrc}/vendor/imap-proto-0.10.2 "$dir"
         chmod -R u+w "$dir"
       fi
-    done
+    }
+    export -f replace_imap_proto
+
+    # Find and replace imap-proto in cargo vendor directories
+    find /build -type d -name "imap-proto-*" 2>/dev/null -exec bash -c 'replace_imap_proto "$0"' {} \;
 
     # Also check cargo home
     if [ -d "$CARGO_HOME/registry/src" ]; then
-      find "$CARGO_HOME/registry/src" -type d -name "imap-proto-*" 2>/dev/null | while read dir; do
-        echo "Found registry imap-proto at: $dir"
-        rm -rf "$dir"
-        cp -r ${cargoSrc}/vendor/imap-proto-0.10.2 "$dir"
-        chmod -R u+w "$dir"
-      done
+      find "$CARGO_HOME/registry/src" -type d -name "imap-proto-*" 2>/dev/null -exec bash -c 'replace_imap_proto "$0"' {} \;
     fi
 
     # Check in cargo vendor dir if set
     if [ -n "''${cargoVendorDir:-}" ] && [ -d "$cargoVendorDir" ]; then
-      find "$cargoVendorDir" -type d -name "imap-proto-*" 2>/dev/null | while read dir; do
-        echo "Found vendor dir imap-proto at: $dir"
-        rm -rf "$dir"
-        cp -r ${cargoSrc}/vendor/imap-proto-0.10.2 "$dir"
-        chmod -R u+w "$dir"
-      done
+      find "$cargoVendorDir" -type d -name "imap-proto-*" 2>/dev/null -exec bash -c 'replace_imap_proto "$0"' {} \;
     fi
   '';
 

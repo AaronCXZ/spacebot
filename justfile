@@ -61,7 +61,7 @@ update-frontend-hash:
     set -e
     echo "Building frontend-updater to get new hash..."
     output=$(nix build .#frontend-updater 2>&1 || true)
-    new_hash=$(echo "$output" | grep -oP '(?<=got: ).*' || true)
+    new_hash=$(echo "$output" | awk '/got:/ {print $2}' || true)
 
     if [ -z "$new_hash" ]; then
         echo "Error: Failed to extract hash from build output"
@@ -73,14 +73,16 @@ update-frontend-hash:
     echo "New hash: $new_hash"
 
     # Check if hash is already up to date
-    current_hash=$(grep -oP 'hash ? "\K[^"]+' nix/default.nix | head -1)
+    current_hash=$(grep -E 'hash \?' nix/default.nix | head -1 | sed -E 's/.*hash \? "([^"]+)".*/\1/')
     if [ "$current_hash" = "$new_hash" ]; then
         echo "Hash is already up to date!"
         exit 0
     fi
 
-    # Update the hash in nix/default.nix
-    sed -i '' "s|hash ? \"[^\"]*\"|hash ? \"$new_hash\"|" nix/default.nix
+    # Update the hash in nix/default.nix (POSIX-safe in-place edit)
+    tmpfile=$(mktemp)
+    sed -E "s|hash \? \"[^\"]+\"|hash ? \"$new_hash\"|" nix/default.nix > "$tmpfile"
+    mv "$tmpfile" nix/default.nix
     echo "Updated nix/default.nix with new hash"
     echo ""
     echo "Next steps:"
