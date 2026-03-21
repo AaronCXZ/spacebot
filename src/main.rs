@@ -1587,6 +1587,12 @@ async fn run(
     let global_task_pool = spacebot::db::connect_global_tasks(&config.instance_dir.join("data"))
         .await
         .context("failed to initialize global task database")?;
+
+    // Migrate legacy per-agent tasks to the global database on first run.
+    spacebot::tasks::migration::migrate_legacy_tasks(&config.instance_dir, &global_task_pool)
+        .await
+        .context("failed to migrate legacy tasks to global database")?;
+
     let global_task_store = Arc::new(spacebot::tasks::TaskStore::new(global_task_pool));
 
     // Start HTTP API server if enabled
