@@ -12,14 +12,14 @@
     then "darwin"
     else if stdenv.buildPlatform.isLinux
     then "linux"
-    else throw "Unsupported host platform for frontend Bun install: ${stdenv.buildPlatform.system}";
+    else throw "Unsupported build platform for frontend Bun install: ${stdenv.buildPlatform.system}";
 
   bunInstallCpu =
     if stdenv.buildPlatform.isAarch64
     then "arm64"
     else if stdenv.buildPlatform.isx86_64
     then "x64"
-    else throw "Unsupported host CPU for frontend Bun install: ${stdenv.buildPlatform.system}";
+    else throw "Unsupported build CPU for frontend Bun install: ${stdenv.buildPlatform.system}";
 
   rollupNativePackage =
     if stdenv.buildPlatform.isLinux && stdenv.buildPlatform.isx86_64
@@ -90,13 +90,13 @@
           --cpu=${bunInstallCpu}
 
         esbuild_native_package="${if esbuildNativePackage == null then "" else esbuildNativePackage}"
-        if [ -n "$esbuild_native_package" ]; then
+        if [ -n "$esbuild_native_package" ] && [ -f ./node_modules/esbuild/package.json ]; then
           esbuild_version="$(node -p "require('./node_modules/esbuild/package.json').version")"
           bun add --dev --no-save --no-progress "$esbuild_native_package@$esbuild_version"
         fi
 
         rollup_native_package="${if rollupNativePackage == null then "" else rollupNativePackage}"
-        if [ -n "$rollup_native_package" ]; then
+        if [ -n "$rollup_native_package" ] && [ -f ./node_modules/rollup/package.json ]; then
           rollup_version="$(node -p "require('./node_modules/rollup/package.json').version")"
           bun add --dev --no-save --no-progress "$rollup_native_package@$rollup_version"
         fi

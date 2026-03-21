@@ -102,11 +102,10 @@
               openssl
               pkg-config
               onnxruntime
-              chromium
-            ];
+            ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ];
 
             ORT_LIB_LOCATION = "${pkgs.onnxruntime}/lib";
-            CHROME_PATH = "${pkgs.chromium}/bin/chromium";
+            CHROME_PATH = if pkgs.stdenv.isLinux then "${pkgs.chromium}/bin/chromium" else "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
             CHROME_FLAGS = "--no-sandbox --disable-dev-shm-usage --disable-gpu";
           };
 
