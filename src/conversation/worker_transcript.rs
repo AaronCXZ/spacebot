@@ -26,6 +26,11 @@ pub enum TranscriptStep {
     /// the correct `Message::User` role instead of treating everything as
     /// `Message::Assistant`.
     UserText { text: String },
+    /// System-originated text (preamble, system prompt).
+    ///
+    /// Distinct from `UserText` so that system messages preserve their role
+    /// when round-tripped through the transcript.
+    SystemText { text: String },
     /// Tool execution result.
     ToolResult {
         call_id: String,
@@ -363,6 +368,13 @@ pub fn transcript_to_history(steps: &[TranscriptStep]) -> Vec<rig::message::Mess
                     });
                 }
             }
+            TranscriptStep::SystemText { text } => {
+                if !text.is_empty() {
+                    messages.push(Message::System {
+                        content: text.clone(),
+                    });
+                }
+            }
             TranscriptStep::ToolResult {
                 call_id,
                 name: _,
@@ -463,7 +475,7 @@ fn convert_history(history: &[rig::message::Message]) -> Vec<TranscriptStep> {
                 }
             }
             rig::message::Message::System { content } => {
-                steps.push(TranscriptStep::UserText {
+                steps.push(TranscriptStep::SystemText {
                     text: content.clone(),
                 });
             }
